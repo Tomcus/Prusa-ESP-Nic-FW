@@ -651,8 +651,15 @@ static void IRAM_ATTR handle_rx_msg_scan_get(uint8_t* data, const esp::Header& h
 
 static void IRAM_ATTR read_message() {
     wait_for_intron();
+    esp::Fletcher16 fl16{};
+    fl16.update(tx_message.intron);
     struct uart0_rx_queue_item queue_item{};
-    uart0_rx_bytes((uint8_t*)&queue_item.header, sizeof(queue_item.header));
+    uart0_rx_bytes(reinterpret_cast<uint8_t *>(&queue_item.header), sizeof(queue_item.header));
+    esp::ChecksumInput header_input {reinterpret_cast<uint8_t *>(&queue_item.header), sizeof(queue_item.header)};
+    fl16.update(header_input);
+    uint32_t checksum = 0;
+    uart0_rx_bytes(reinterpret_cast<uint8_t *>(&checksum), sizeof(checksum));
+    checksum = ntohl(checksum);
 
     switch (queue_item.header.type) {
     case esp::MessageType::PACKET_V2:
@@ -696,11 +703,19 @@ static void IRAM_ATTR read_message() {
         uart0_rx_skip_bytes(queue_item.header.size);
     }
 
-    if (xQueueSendToBack(uart0_rx_queue, &queue_item, 0) != pdTRUE) {
-        ESP_LOGE(TAG, "xQueueSendToBack failed (uart0rx)");
-        if (queue_item.data) {
-            free(queue_item.data);
+    if (queue_item.header.size > 0 && queue_item.data != nullptr) {
+        fl16.update(esp::ChecksumInput{queue_item.data, queue_item.header.size});
+    }
+
+    if (fl16.get() == checksum) {
+        if (xQueueSendToBack(uart0_rx_queue, &queue_item, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "xQueueSendToBack failed (uart0rx)");
+            if (queue_item.data) {
+                free(queue_item.data);
+            }
         }
+    } else {
+        ESP_LOGE(TAG, "Checksum mismatch: MT %d, calc: %x ref: %x", static_cast<uint8_t>(queue_item.header.type), fl16.get(), checksum);
     }
 }
 
@@ -738,9 +753,17 @@ static void IRAM_ATTR uart0_tx_task(void *arg) {
         struct uart0_tx_queue_item queue_item;
         if (xQueueReceive(uart0_tx_queue, &queue_item, portMAX_DELAY) == pdTRUE) {
 
-            // send fix-sized part of the message (intron + header)
+            // send fix-sized part of the message (intron + header + checksum)
             tx_message.header = queue_item.header;
-            uart0_tx_bytes(tx_message.bytes, sizeof(tx_message.bytes));
+            esp::Fletcher16 fl16{};
+            fl16.update(tx_message.intron);
+            esp::ChecksumInput header_input{reinterpret_cast<uint8_t *>(&tx_message.header), sizeof(tx_message.header)};
+            fl16.update(header_input);
+            if (queue_item.header.size != 0 && queue_item.data != nullptr) {
+                fl16.update(esp::ChecksumInput{queue_item.data, ntohs(queue_item.header.size)});
+            }
+            tx_message.data_checksum = htonl(fl16.get());
+            uart0_tx_bytes(reinterpret_cast<uint8_t *>(&tx_message), sizeof(tx_message));
 
             // send variable-sized part of the message (payload depending on message type)
             switch (queue_item.header.type) {
