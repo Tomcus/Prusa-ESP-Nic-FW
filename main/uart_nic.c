@@ -366,15 +366,23 @@ static void IRAM_ATTR start_wifi_connect_task() {
     xTaskCreate(wifi_re_connect_task, "wifi_connect_task", 2048, NULL, tskIDLE_PRIORITY, NULL);
 }
 
+#define LOWER_TX_POWER 48
+
 static void IRAM_ATTR handle_disconnect_and_try_reconnect() {
     associated = false;
     send_link_status(0);
-    if (s_retry_num < CONFIG_ESP_MAXIMUM_RETRY) {
+    if (s_retry_num < 20) {
         start_wifi_connect_task();
         s_retry_num++;
         ESP_LOGI(TAG, "retry to connect to the AP");
-        ESP_LOGI(TAG,"connect to the AP fail, now lowering RF power to reduce interference");
-        esp_wifi_set_max_tx_power(48); // 12dB (down from 20dB) to reduce antenna reflections, needed for some modules (see ESP8266_RTOS_SDK#1200)
+        int8_t current_tx = 0;
+        esp_wifi_get_max_tx_power(&current_tx);
+        esp_err_t err = esp_wifi_set_max_tx_power(current_tx - 12);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "connect to the AP fail, now lowering RF power to reduce interference (%d -> %d)", current_tx, current_tx - 12);
+        } else {
+            ESP_LOGW(TAG, "connect to the AP fail, unable to lower RF power, reason: %s", esp_err_to_name(err));
+        }
     } else {
         connecting = false;
     }
@@ -579,6 +587,7 @@ static void IRAM_ATTR handle_rx_msg_clientconfig_v2(uint8_t* data, struct header
     esp_wifi_stop();
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(127));
     wifi_running = true;
     send_device_info();
 }
@@ -819,6 +828,43 @@ void IRAM_ATTR app_main() {
     esp_wifi_restore();
     wifi_init_sta();
     esp_wifi_set_ps(WIFI_PS_NONE);
+
+    ESP_LOGI(TAG, "Chip INFO");
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    switch (chip_info.model) {
+        case CHIP_ESP8266:
+            ESP_LOGI(TAG, "Model: esp8266");
+            break;
+        case CHIP_ESP32:
+            ESP_LOGI(TAG, "Model: esp32");
+            break;
+        default:
+            ESP_LOGW(TAG, "Model: <unknown> %d", chip_info.model);
+    }
+    ESP_LOGI(TAG, "Features:");
+    if (chip_info.features & CHIP_FEATURE_EMB_FLASH) {
+        ESP_LOGI(TAG, "Embeded flash: yes");
+    } else {
+        ESP_LOGI(TAG, "Embeded flash: no");
+    }
+    if (chip_info.features & CHIP_FEATURE_WIFI_BGN) {
+        ESP_LOGI(TAG, "Wifi 2.4GHz: yes");
+    } else {
+        ESP_LOGI(TAG, "Wifi 2.4GHz: no");
+    }
+    if (chip_info.features & CHIP_FEATURE_BLE) {
+        ESP_LOGI(TAG, "Bluetooth LE: yes");
+    } else {
+        ESP_LOGI(TAG, "Bluetooth LE: no");
+    }
+    if (chip_info.features & CHIP_FEATURE_BT) {
+        ESP_LOGI(TAG, "Bluetooth Classic: yes");
+    } else {
+        ESP_LOGI(TAG, "Bluetooth Classic: no");
+    }
+    ESP_LOGI(TAG, "Cores: %d", chip_info.cores);
+    ESP_LOGI(TAG, "Chip revision: %d", chip_info.revision);
 
     uart0_rx_queue = xQueueCreate(20, sizeof(struct uart0_rx_queue_item));
     if (uart0_rx_queue == 0) {
