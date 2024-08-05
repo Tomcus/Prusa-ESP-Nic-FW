@@ -40,6 +40,8 @@
 #include "nvs_flash.h"
 
 #include "esp_private/wifi.h"
+#include "esp8266/uart_register.h"
+
 extern "C" {
     // including esp_supplicant/esp_wpa.h breaks c++ compilation,
     // lets forward declare the needed function from that header
@@ -652,20 +654,76 @@ static void IRAM_ATTR handle_rx_msg_scan_get(uint8_t* data, const esp::Header& h
     }
 }
 
+// stolen from https://github.com/espressif/ESP8266_RTOS_SDK/blob/master/components/esp8266/source/ets_printf.c#L33
+#ifndef CONFIG_ESP_CONSOLE_UART_NONE
+static void uart_putc(int c)
+{
+    while (1) {
+        uint32_t fifo_cnt = READ_PERI_REG(UART_STATUS(CONFIG_ESP_CONSOLE_UART_NUM)) & (UART_TXFIFO_CNT << UART_TXFIFO_CNT_S);
+
+        if ((fifo_cnt >> UART_TXFIFO_CNT_S & UART_TXFIFO_CNT) < 126)
+            break;
+    }
+
+    WRITE_PERI_REG(UART_FIFO(CONFIG_ESP_CONSOLE_UART_NUM) , c);
+}
+#else
+#define uart_putc(_c) { }
+#endif
+
+static constexpr size_t MAX_LOG_SIZE = 128;
+
+static struct {
+    putchar_like_t original_logger = nullptr;
+    esp::data::EspLogLevel expected_system = esp::data::EspLogLevel::OFF; // TODO: filter system logs based on send setting (currently every log is send)
+    esp::data::EspLogLevel expected_local = esp::data::EspLogLevel::OFF;
+} log_over_esp_prot {};
+
+
+static void IRAM_ATTR send_log_over_esp_protocol(const std::array<char, MAX_LOG_SIZE>& buffer, size_t read) {
+    uart0_tx_queue_item item{};
+    item.header.type = esp::MessageType::LOG;
+    item.header.size = htons(read);
+    item.data = reinterpret_cast<uint8_t *>(malloc(read));
+    memcpy(item.data, buffer.data(), read);
+    if (xQueueSendToBack(uart0_tx_queue, &item, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "xQueueSendToBack failed (uart0tx)");
+    }
+}
+
+extern "C" int ets_putc(int c) {
+    if (log_over_esp_prot.original_logger != nullptr && isascii(c)) {
+        static std::array<char, MAX_LOG_SIZE> buffer{};
+        static size_t read = 0;
+        static bool in_ansi_bs = false;
+
+        if (read == buffer.size() || (!in_ansi_bs && c == '\n')) {
+            send_log_over_esp_protocol(buffer, read);
+            read = 0;
+        }
+
+        if (c == 0x1B) { // ANSI escape sequence - skip we don't need to send those
+            in_ansi_bs = true;
+        } else if (in_ansi_bs && c == 'm') { // end of ANSI escape sequence - we can recieve next chars as normal string
+            in_ansi_bs = false;
+        } else if (!in_ansi_bs && c != '\n') {
+            buffer[read++] = c;
+        }
+
+        return c;
+    } else {
+        uart_putc(c);
+        return c;
+    }
+}
+
 static int IRAM_ATTR log_over_uart(int c) {
-    static std::array<char, 128> buffer{};
+    static std::array<char, MAX_LOG_SIZE> buffer{};
     static size_t read = 0;
 
     if (isascii(c)) {
         if (read == buffer.size() || c == '\n') {
-            uart0_tx_queue_item item{};
-            item.header.type = esp::MessageType::LOG;
-            item.header.size = htons(read);
-            item.data = reinterpret_cast<uint8_t *>(malloc(read));
-            memcpy(item.data, buffer.data(), read);
-            if (xQueueSendToBack(uart0_tx_queue, &item, 0) != pdTRUE) {
-                ESP_LOGE(TAG, "xQueueSendToBack failed (uart0tx)");
-            }
+            send_log_over_esp_protocol(buffer, read);
             read = 0;
         }
 
@@ -703,21 +761,19 @@ static void IRAM_ATTR handle_rx_msg_log(uint8_t* data, const esp::Header& header
         return;
     }
 
-    static putchar_like_t original_logger = nullptr;
-
     auto* ena_log = reinterpret_cast<esp::data::EnableLogging *>(data);
     if (ena_log->system == esp::data::EspLogLevel::OFF && ena_log->nic == esp::data::EspLogLevel::OFF) {
-        if (original_logger != nullptr) {
+        if (log_over_esp_prot.original_logger != nullptr) {
             // Turning both off -> reset to "normal" config
-            esp_log_set_putchar(original_logger);
+            esp_log_set_putchar(log_over_esp_prot.original_logger);
             set_defaul_logging();
-            original_logger = nullptr;
+            log_over_esp_prot.original_logger = nullptr;
         } else {
             ESP_LOGW(TAG, "Unable to restore original logger - no logger stored");
         }
     } else {
-        if (original_logger == nullptr) {
-            original_logger = esp_log_set_putchar(log_over_uart);
+        if (log_over_esp_prot.original_logger == nullptr) {
+            log_over_esp_prot.original_logger = esp_log_set_putchar(log_over_uart);
         }
         esp_log_level_set("*", from_message_log_type(ena_log->system));
         esp_log_level_set(TAG, from_message_log_type(ena_log->nic));
